@@ -4,9 +4,6 @@ import json
 import requests
 from datetime import datetime, date
 from serpapi.google_search import GoogleSearch
-from agno.agent import Agent
-from agno.models.google import Gemini
-from agno.tools.serpapi import SerpApiTools
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -21,18 +18,11 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 # API KEYS
 # ─────────────────────────────────────────────
-import os
-import streamlit as st
+# 🔑 GROQ API KEY — get yours FREE at https://console.groq.com/keys
 
-# ─────────────────────────────────────────────
-# SECURE API KEYS (Pulled from Streamlit Secrets)
-# ─────────────────────────────────────────────
-# If running locally, it falls back to empty strings or local env vars
-GOOGLE_API_KEY   = st.secrets.get("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
-SERPAPI_API_KEY  = st.secrets.get("SERPAPI_API_KEY", os.environ.get("SERPAPI_API_KEY", ""))
-UNSPLASH_KEY     = st.secrets.get("UNSPLASH_KEY", "client_id=jxIjm4v_bglM6mYKVgnLFrOmobHSRiixe8dKyqS4_B4")
-
-os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
+GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+SERPAPI_API_KEY = st.secrets["SERPAPI_API_KEY"]
+UNSPLASH_KEY = st.secrets["UNSPLASH_KEY"]
 # ─────────────────────────────────────────────
 # SESSION STATE BOOT
 # ─────────────────────────────────────────────
@@ -426,6 +416,35 @@ def get_weather(city):
         return None
 
 # ─────────────────────────────────────────────
+# GROQ AI HELPER  (free — no billing required)
+# Model: llama-3.3-70b-versatile  |  free tier
+# ─────────────────────────────────────────────
+def groq_chat(system_prompt: str, user_prompt: str) -> str:
+    """Call Groq's free LLM API and return the assistant text."""
+    try:
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "llama-3.3-70b-versatile",   # free Groq model
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            "max_tokens": 1500,
+            "temperature": 0.7,
+        }
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers, json=payload, timeout=60
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"⚠️ Groq API error: {e}"
+
+# ─────────────────────────────────────────────
 # NAVBAR (rendered via HTML + st.radio hack)
 # ─────────────────────────────────────────────
 NAV_ITEMS = ["🏠 Home", "🌅 Discover", "✈️ Plan Trip", "🗺️ Itinerary", "🌤️ Weather"]
@@ -718,69 +737,39 @@ elif nav == "✈️ Plan Trip":
                 st.error(f"Flight error: {e}")
                 st.session_state.best_flights = []
 
-        # ── Retry helper for Gemini 503 / high-demand errors ──
-        import time
-
-        # Model priority list: try in order until one succeeds
-        GEMINI_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
-
-        def run_agent_with_retry(agent_name, instructions, prompt, tools=None, max_retries=3):
-            """Try each model in GEMINI_MODELS with exponential back-off on 503."""
-            last_err = None
-            for model_id in GEMINI_MODELS:
-                for attempt in range(max_retries):
-                    try:
-                        kwargs = dict(
-                            name=agent_name,
-                            model=Gemini(id=model_id),
-                            instructions=instructions,
-                        )
-                        if tools:
-                            kwargs["tools"] = tools
-                        agent = Agent(**kwargs)
-                        res = agent.run(prompt, stream=False)
-                        return res.content  # success
-                    except Exception as e:
-                        last_err = e
-                        err_str = str(e)
-                        # 503 / high demand → wait and retry
-                        if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str.lower():
-                            wait = 2 ** attempt  # 1s, 2s, 4s
-                            time.sleep(wait)
-                            continue
-                        # Any other error: skip to next model immediately
-                        break
-            return f"⚠️ All models unavailable. Last error: {last_err}"
-
         # STEP 2: Research
         with st.spinner("🔍  Researching attractions and admission prices..."):
-            st.session_state.research_text = run_agent_with_retry(
-                agent_name="Research Agent",
-                instructions=f"Expert destination researcher. Provide top sites and ticket costs for {dst_in}. Use currency {sym}. Structured markdown, no greeting.",
-                prompt=f"Top attractions + admission prices in {dest_city}. {activities}. {special_notes}. Currency: {sym}.",
-                tools=[SerpApiTools(api_key=SERPAPI_API_KEY)],
-            )
+            try:
+                st.session_state.research_text = groq_chat(
+                    system_prompt=f"Expert destination researcher. Provide top sites and ticket costs for {dst_in}. Use currency {sym}. Structured markdown, no greeting.",
+                    user_prompt=f"Top attractions + admission prices in {dest_city}. {activities}. {special_notes}. Currency: {sym}."
+                )
+            except Exception as e:
+                st.session_state.research_text = f"Error: {e}"
 
         # STEP 3: Hotels
         with st.spinner("🏨  Evaluating hotels and dining options..."):
-            st.session_state.hotel_text = run_agent_with_retry(
-                agent_name="Hotel Agent",
-                instructions=f"Hospitality agent. Find lodging + dining for {dest_city}. Tier: {hotel_stars}/{budget_tier}. Prices in {sym}. Clean markdown.",
-                prompt=f"Hotels and restaurants in {dest_city} for {hotel_stars}, budget tier {budget_tier}. Prices in {sym}.",
-                tools=[SerpApiTools(api_key=SERPAPI_API_KEY)],
-            )
+            try:
+                st.session_state.hotel_text = groq_chat(
+                    system_prompt=f"Hospitality agent. Find lodging + dining for {dest_city}. Tier: {hotel_stars}/{budget_tier}. Prices in {sym}. Clean markdown.",
+                    user_prompt=f"Hotels and restaurants in {dest_city} for {hotel_stars}, budget tier {budget_tier}. Prices in {sym}."
+                )
+            except Exception as e:
+                st.session_state.hotel_text = f"Error: {e}"
 
         # STEP 4: Planner
         with st.spinner("🗺️  Building your personalised itinerary..."):
-            st.session_state.itinerary_text = run_agent_with_retry(
-                agent_name="Planner Agent",
-                instructions=f"""Master Cost & Logistics Planner. Synthesize data into a premium plan.
+            try:
+                st.session_state.itinerary_text = groq_chat(
+                    system_prompt=f"""Master Cost & Logistics Planner. Synthesize data into a premium plan.
 RULES:
 1. Start with '## 💰 TRIP EXPENSE SUMMARY' markdown table: Flights, Lodging, Transit, Food, Activities, Grand Total (max {sym}{max_budget}).
 2. Day-by-day schedule with [Cost: {sym}XX] tags.
 3. Transit style: {transit_style}. Cabin: {flight_class}. Theme: {theme}.""",
-                prompt=f"{days_in}-day plan for {dest_city}. Currency {sym}. Budget {sym}{max_budget}.\nActivities: {st.session_state.research_text}\nLodging: {st.session_state.hotel_text}",
-            )
+                    user_prompt=f"{days_in}-day plan for {dest_city}. Currency {sym}. Budget {sym}{max_budget}.\nActivities: {st.session_state.research_text}\nLodging: {st.session_state.hotel_text}"
+                )
+            except Exception as e:
+                st.session_state.itinerary_text = f"Error: {e}"
 
         # STEP 5: Weather
         with st.spinner("🌤️  Fetching live weather data..."):
